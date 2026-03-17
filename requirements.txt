@@ -3,3 +3,4 @@ uvicorn[standard]
 pydantic
 SQLAlchemy>=2.0
 psycopg[binary]
+firebase-admin
