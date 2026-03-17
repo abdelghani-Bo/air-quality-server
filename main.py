@@ -6,6 +6,9 @@ import csv
 import io
 import os
 import logging
+import firebase_admin
+from firebase_admin import credentials, messaging
+import json
 
 from sqlalchemy import (
     create_engine,
@@ -21,14 +24,12 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 # =========================================================
 # LOGGING
 # =========================================================
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("air-quality-server")
 
 # =========================================================
 # DATABASE CONFIG
 # =========================================================
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
@@ -48,9 +49,15 @@ MAX_RECORDS_PER_DEVICE = 1000
 DEVICE_ACTIVE_SECONDS = 15
 
 # =========================================================
+# FIREBASE INIT
+# =========================================================
+firebase_key = json.loads(os.getenv("FIREBASE_KEY"))
+cred = credentials.Certificate(firebase_key)
+firebase_admin.initialize_app(cred)
+
+# =========================================================
 # SQLALCHEMY SETUP
 # =========================================================
-
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -67,20 +74,17 @@ Base = declarative_base()
 # =========================================================
 # DATABASE MODELS
 # =========================================================
-
 class AirQuality(Base):
     __tablename__ = "air_quality"
 
     id = Column(Integer, primary_key=True, index=True)
     timestamp = Column(DateTime, index=True)
     device_id = Column(String, index=True)
-
     temperature = Column(Float)
     humidity = Column(Float)
     co_ppm = Column(Float)
     h2_ppm = Column(Float)
     butane_ppm = Column(Float)
-
     alert = Column(Boolean)
     co_alert = Column(Boolean)
     butane_alert = Column(Boolean)
@@ -96,10 +100,18 @@ class UserDevice(Base):
     user_id = Column(String, index=True)
     device_id = Column(String, index=True)
 
+
+# جدول تخزين توكنات الأجهزة
+class DeviceToken(Base):
+    __tablename__ = "device_tokens"
+
+    id = Column(Integer, primary_key=True)
+    device_id = Column(String, index=True)
+    token = Column(String)
+
 # =========================================================
 # FASTAPI APP
 # =========================================================
-
 app = FastAPI(
     title="Air Quality IoT Server",
     description="ESP32 → FastAPI → PostgreSQL → Flutter / CSV / ML",
@@ -109,7 +121,6 @@ app = FastAPI(
 # =========================================================
 # STARTUP
 # =========================================================
-
 @app.on_event("startup")
 def startup():
     logger.info("Creating database tables (if not exist)")
@@ -118,7 +129,6 @@ def startup():
 # =========================================================
 # DATABASE DEPENDENCY
 # =========================================================
-
 def get_db():
     db = SessionLocal()
     try:
@@ -129,7 +139,6 @@ def get_db():
 # =========================================================
 # ALERT THRESHOLDS
 # =========================================================
-
 CO_THRESHOLD = 50.0
 BUTANE_THRESHOLD = 10.0
 TEMP_MIN = 15.0
@@ -140,7 +149,6 @@ HUMIDITY_MAX = 70.0
 # =========================================================
 # PYDANTIC MODELS
 # =========================================================
-
 class ESP32Data(BaseModel):
     device_id: str
     temperature: float
@@ -149,7 +157,6 @@ class ESP32Data(BaseModel):
     h2_ppm: float
     butane_ppm: float
 
-
 class RegisterDevice(BaseModel):
     user_id: str
     device_id: str
@@ -157,34 +164,31 @@ class RegisterDevice(BaseModel):
 # =========================================================
 # HELPERS
 # =========================================================
+def send_notification(tokens, title, body):
+    for token in tokens:
+        try:
+            message = messaging.Message(
+                notification=messaging.Notification(
+                    title=title,
+                    body=body
+                ),
+                token=token,
+            )
+            messaging.send(message)
+        except Exception as e:
+            logger.error(f"Notification error: {e}")
 
 def compute_alerts(data: ESP32Data):
-
     co_alert = data.co_ppm > CO_THRESHOLD
     butane_alert = data.butane_ppm > BUTANE_THRESHOLD
     temperature_alert = not (TEMP_MIN <= data.temperature <= TEMP_MAX)
     humidity_alert = not (HUMIDITY_MIN <= data.humidity <= HUMIDITY_MAX)
-
-    alert = any([
-        co_alert,
-        butane_alert,
-        temperature_alert,
-        humidity_alert,
-    ])
-
+    alert = any([co_alert, butane_alert, temperature_alert, humidity_alert])
     return alert, co_alert, butane_alert, temperature_alert, humidity_alert
 
-
 def cleanup_old_records(db: Session, device_id: str):
-
-    count = (
-        db.query(AirQuality)
-        .filter(AirQuality.device_id == device_id)
-        .count()
-    )
-
+    count = db.query(AirQuality).filter(AirQuality.device_id == device_id).count()
     if count > MAX_RECORDS_PER_DEVICE:
-
         to_delete = (
             db.query(AirQuality)
             .filter(AirQuality.device_id == device_id)
@@ -192,29 +196,57 @@ def cleanup_old_records(db: Session, device_id: str):
             .limit(count - MAX_RECORDS_PER_DEVICE)
             .all()
         )
-
         for row in to_delete:
             db.delete(row)
-
         db.commit()
-
         logger.info(f"Deleted {len(to_delete)} old records")
 
 # =========================================================
 # ROUTES
 # =========================================================
+@app.post("/api/save-token")
+def save_token(device_id: str, token: str, db: Session = Depends(get_db)):
+    exists = db.query(DeviceToken).filter(
+        DeviceToken.device_id == device_id,
+        DeviceToken.token == token
+    ).first()
+    if exists:
+        return {"status": "already_saved"}
+    new_token = DeviceToken(device_id=device_id, token=token)
+    db.add(new_token)
+    db.commit()
+    return {"status": "saved"}
 
 # استقبال بيانات ESP32
 @app.post("/api/data")
-def receive_data(
-    data: ESP32Data,
-    db: Session = Depends(get_db),
-):
-
+def receive_data(data: ESP32Data, db: Session = Depends(get_db)):
     timestamp = datetime.utcnow()
 
+    # 1. جيب آخر قراءة
+    last = (
+        db.query(AirQuality)
+        .filter(AirQuality.device_id == data.device_id)
+        .order_by(AirQuality.timestamp.desc())
+        .first()
+    )
+
+    # 2. حساب alert
     alert, co_alert, butane_alert, temp_alert, hum_alert = compute_alerts(data)
 
+    # 3. شرط notification (مهم)
+    if last and alert and not last.alert:
+        tokens = db.query(DeviceToken).filter(
+            DeviceToken.device_id == data.device_id
+        ).all()
+        token_list = [t.token for t in tokens]
+        if token_list:
+            send_notification(
+                token_list,
+                "🚨 Air Quality Alert",
+                f"خطر في الجهاز {data.device_id}"
+            )
+
+    # 4. حفظ البيانات
     record = AirQuality(
         timestamp=timestamp,
         device_id=data.device_id,
@@ -229,66 +261,43 @@ def receive_data(
         temperature_alert=temp_alert,
         humidity_alert=hum_alert,
     )
-
     db.add(record)
     db.commit()
 
     cleanup_old_records(db, data.device_id)
-
     return {"status": "ok"}
 
 # =========================================================
 # تسجيل جهاز لمستخدم
 # =========================================================
-
 @app.post("/api/register-device")
-def register_device(
-    data: RegisterDevice,
-    db: Session = Depends(get_db)
-):
-
+def register_device(data: RegisterDevice, db: Session = Depends(get_db)):
     exists = db.query(UserDevice).filter(
         UserDevice.user_id == data.user_id,
         UserDevice.device_id == data.device_id
     ).first()
-
     if exists:
         return {"status": "already_registered"}
-
-    record = UserDevice(
-        user_id=data.user_id,
-        device_id=data.device_id
-    )
-
+    record = UserDevice(user_id=data.user_id, device_id=data.device_id)
     db.add(record)
     db.commit()
-
     return {"status": "device_registered"}
 
 # =========================================================
 # جلب بيانات كل أجهزة المستخدم
 # =========================================================
-
 @app.get("/api/user/{user_id}")
 def get_user_devices(user_id: str, db: Session = Depends(get_db)):
-
-    devices = db.query(UserDevice).filter(
-        UserDevice.user_id == user_id
-    ).all()
-
+    devices = db.query(UserDevice).filter(UserDevice.user_id == user_id).all()
     result = []
-
     for d in devices:
-
         last = (
             db.query(AirQuality)
             .filter(AirQuality.device_id == d.device_id)
             .order_by(AirQuality.timestamp.desc())
             .first()
         )
-
         if last:
-
             result.append({
                 "device_id": d.device_id,
                 "temperature": last.temperature,
@@ -305,28 +314,23 @@ def get_user_devices(user_id: str, db: Session = Depends(get_db)):
 
                 "timestamp": last.timestamp.isoformat()
             })
-
     return result
+
 # =========================================================
 # معلومات جهاز واحد
 # =========================================================
-
 @app.get("/api/devices/{device_id}")
 def get_device(device_id: str, db: Session = Depends(get_db)):
-
     last = (
         db.query(AirQuality)
         .filter(AirQuality.device_id == device_id)
         .order_by(AirQuality.timestamp.desc())
         .first()
     )
-
     if not last:
         raise HTTPException(status_code=404, detail="device_not_found")
-
     now = datetime.utcnow()
     diff = (now - last.timestamp).total_seconds()
-
     return {
         "device_id": device_id,
         "active": diff <= DEVICE_ACTIVE_SECONDS,
@@ -343,19 +347,15 @@ def get_device(device_id: str, db: Session = Depends(get_db)):
 # =========================================================
 # آخر قراءة
 # =========================================================
-
 @app.get("/latest")
 def latest(db: Session = Depends(get_db)):
-
     row = (
         db.query(AirQuality)
         .order_by(AirQuality.timestamp.desc())
         .first()
     )
-
     if not row:
         return {"message": "No data yet"}
-
     return {
         "timestamp": row.timestamp.isoformat(),
         "device_id": row.device_id,
@@ -370,12 +370,9 @@ def latest(db: Session = Depends(get_db)):
 # =========================================================
 # تحميل CSV
 # =========================================================
-
 @app.get("/download/csv")
 def download_csv(db: Session = Depends(get_db)):
-
     rows = db.query(AirQuality).all()
-
     output = io.StringIO()
     writer = csv.writer(output)
 
@@ -395,7 +392,6 @@ def download_csv(db: Session = Depends(get_db)):
     ])
 
     for r in rows:
-
         writer.writerow([
             r.timestamp.isoformat(),
             r.device_id,
@@ -412,20 +408,17 @@ def download_csv(db: Session = Depends(get_db)):
         ])
 
     output.seek(0)
-
     return StreamingResponse(
         io.BytesIO(output.getvalue().encode()),
         media_type="text/csv",
         headers={
-            "Content-Disposition":
-            "attachment; filename=air_quality_data.csv"
+            "Content-Disposition": "attachment; filename=air_quality_data.csv"
         },
     )
 
 # =========================================================
 # HEALTH CHECK
 # =========================================================
-
 @app.get("/health")
 def health():
     return {"status": "running"}
