@@ -278,35 +278,35 @@ def get_user_devices(user_id: str, db: Session = Depends(get_db)):
 
     result = []
 
- for d in devices:
+    for d in devices:
 
-    last = (
-        db.query(AirQuality)
-        .filter(AirQuality.device_id == d.device_id)
-        .order_by(AirQuality.timestamp.desc())
-        .first()
-    )
+        last = (
+            db.query(AirQuality)
+            .filter(AirQuality.device_id == d.device_id)
+            .order_by(AirQuality.timestamp.desc())
+            .first()
+        )
 
-    if last:
+        if last:
 
-        result.append({
-            "device_id": d.device_id,
-            "temperature": last.temperature,
-            "humidity": last.humidity,
-            "co_ppm": last.co_ppm,
-            "h2_ppm": last.h2_ppm,
-            "butane_ppm": last.butane_ppm,
+            result.append({
+                "device_id": d.device_id,
+                "temperature": last.temperature,
+                "humidity": last.humidity,
+                "co_ppm": last.co_ppm,
+                "h2_ppm": last.h2_ppm,
+                "butane_ppm": last.butane_ppm,
 
-            "alert": last.alert,
-            "co_alert": last.co_alert,
-            "butane_alert": last.butane_alert,
-            "temperature_alert": last.temperature_alert,
-            "humidity_alert": last.humidity_alert,
+                "alert": last.alert,
+                "co_alert": last.co_alert,
+                "butane_alert": last.butane_alert,
+                "temperature_alert": last.temperature_alert,
+                "humidity_alert": last.humidity_alert,
 
-            "timestamp": last.timestamp.isoformat()
-        })
+                "timestamp": last.timestamp.isoformat()
+            })
+
     return result
-
 # =========================================================
 # معلومات جهاز واحد
 # =========================================================
