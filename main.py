@@ -421,4 +421,30 @@ def download_csv(db: Session = Depends(get_db)):
 # =========================================================
 @app.get("/health")
 def health():
+    
     return {"status": "running"}
+
+
+
+
+@app.delete("/api/delete-user/{user_id}")
+def delete_user(user_id: str, db: Session = Depends(get_db)):
+
+    # 1. جلب كل الأجهزة المرتبطة بالمستخدم
+    user_devices = db.query(UserDevice).filter(UserDevice.user_id == user_id).all()
+
+    if not user_devices:
+        return {"status": "user_not_found"}
+
+    # 2. حذف ربط المستخدم بالأجهزة
+    db.query(UserDevice).filter(UserDevice.user_id == user_id).delete(synchronize_session=False)
+
+    # 3. حفظ التغييرات
+    db.commit()
+
+    device_ids = [d.device_id for d in user_devices]
+
+    return {
+        "status": "user_deleted",
+        "deleted_device_ids": device_ids
+    }
