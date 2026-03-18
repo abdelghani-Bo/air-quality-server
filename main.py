@@ -161,6 +161,11 @@ class RegisterDevice(BaseModel):
     user_id: str
     device_id: str
 
+class SaveToken(BaseModel):
+    device_id: str
+    token: str
+
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -205,17 +210,26 @@ def cleanup_old_records(db: Session, device_id: str):
 # ROUTES
 # =========================================================
 @app.post("/api/save-token")
-def save_token(device_id: str, token: str, db: Session = Depends(get_db)):
+def save_token(data: SaveToken, db: Session = Depends(get_db)):
+
     exists = db.query(DeviceToken).filter(
-        DeviceToken.device_id == device_id,
-        DeviceToken.token == token
+        DeviceToken.device_id == data.device_id,
+        DeviceToken.token == data.token
     ).first()
+
     if exists:
         return {"status": "already_saved"}
-    new_token = DeviceToken(device_id=device_id, token=token)
+
+    new_token = DeviceToken(
+        device_id=data.device_id,
+        token=data.token
+    )
+
     db.add(new_token)
     db.commit()
+
     return {"status": "saved"}
+
 
 # استقبال بيانات ESP32
 @app.post("/api/data")
