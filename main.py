@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime
+from sqlalchemy import func
 import csv
 import io
 import os
@@ -45,7 +46,7 @@ elif DATABASE_URL.startswith("postgresql://"):
         "postgresql://", "postgresql+psycopg://"
     )
 
-MAX_RECORDS_PER_DEVICE = 1000
+MAX_RECORDS_PER_DEVICE = 10000
 DEVICE_ACTIVE_SECONDS = 15
 
 # =========================================================
@@ -101,6 +102,23 @@ class UserDevice(Base):
     device_id = Column(String, index=True)
 
 
+class AirQuality30Min(Base):
+    __tablename__ = "air_quality_30min"
+
+    id = Column(Integer, primary_key=True)
+    device_id = Column(String, index=True)
+    timestamp = Column(DateTime, index=True)
+
+    temperature_max = Column(Float)
+    humidity_max = Column(Float)
+    co_max = Column(Float)
+    h2_max = Column(Float)
+    butane_max = Column(Float)
+
+    alert = Column(Boolean)
+
+
+
 # جدول تخزين توكنات الأجهزة
 class DeviceToken(Base):
     __tablename__ = "device_tokens"
@@ -108,6 +126,9 @@ class DeviceToken(Base):
     id = Column(Integer, primary_key=True)
     device_id = Column(String, index=True)
     token = Column(String)
+
+
+
 
 # =========================================================
 # FASTAPI APP
@@ -190,6 +211,55 @@ def compute_alerts(data: ESP32Data):
     humidity_alert = not (HUMIDITY_MIN <= data.humidity <= HUMIDITY_MAX)
     alert = any([co_alert, butane_alert, temperature_alert, humidity_alert])
     return alert, co_alert, butane_alert, temperature_alert, humidity_alert
+
+
+
+def aggregate_30min(db: Session, device_id: str):
+
+    now = datetime.utcnow()
+
+    # تحديد بداية نصف الساعة
+    minute = (now.minute // 30) * 30
+    period_start = now.replace(minute=minute, second=0, microsecond=0)
+
+    # تحقق واش already aggregated
+    exists = db.query(AirQuality30Min).filter(
+        AirQuality30Min.device_id == device_id,
+        AirQuality30Min.timestamp == period_start
+    ).first()
+
+    if exists:
+        return  # avoid duplicate
+
+    result = db.query(
+        func.max(AirQuality.temperature),
+        func.max(AirQuality.humidity),
+        func.max(AirQuality.co_ppm),
+        func.max(AirQuality.h2_ppm),
+        func.max(AirQuality.butane_ppm),
+        func.max(AirQuality.alert)
+    ).filter(
+        AirQuality.device_id == device_id,
+        AirQuality.timestamp >= period_start
+    ).first()
+
+    if result:
+
+        record = AirQuality30Min(
+            device_id=device_id,
+            timestamp=period_start,
+            temperature_max=result[0],
+            humidity_max=result[1],
+            co_max=result[2],
+            h2_max=result[3],
+            butane_max=result[4],
+            alert=result[5]
+        )
+
+        db.add(record)
+        db.commit()
+
+
 
 def cleanup_old_records(db: Session, device_id: str):
     count = db.query(AirQuality).filter(AirQuality.device_id == device_id).count()
@@ -277,7 +347,7 @@ def receive_data(data: ESP32Data, db: Session = Depends(get_db)):
     )
     db.add(record)
     db.commit()
-
+    aggregate_30min(db, data.device_id)
     cleanup_old_records(db, data.device_id)
     return {"status": "ok"}
 
@@ -437,6 +507,29 @@ def download_csv(db: Session = Depends(get_db)):
 def health():
     
     return {"status": "running"}
+
+
+
+
+@app.get("/api/history/{device_id}")
+def get_history(device_id: str, db: Session = Depends(get_db)):
+
+    rows = db.query(AirQuality30Min).filter(
+        AirQuality30Min.device_id == device_id
+    ).order_by(AirQuality30Min.timestamp.desc()).all()
+
+    return [
+        {
+            "timestamp": r.timestamp.isoformat(),
+            "temperature": r.temperature_max,
+            "humidity": r.humidity_max,
+            "co": r.co_max,
+            "h2": r.h2_max,
+            "butane": r.butane_max,
+            "alert": r.alert
+        }
+        for r in rows
+    ]
 
 
 
